@@ -21,21 +21,19 @@ import java.nio.ByteBuffer
 import java.text.SimpleDateFormat
 import java.util.{Date, HashMap => JHashMap}
 
-import scala.collection.{mutable, Map}
+import scala.collection.{Map, mutable}
 import scala.collection.JavaConverters._
 import scala.collection.mutable.ArrayBuffer
 import scala.reflect.ClassTag
 import scala.util.DynamicVariable
-
 import com.clearspring.analytics.stream.cardinality.HyperLogLogPlus
 import org.apache.hadoop.conf.{Configurable, Configuration}
 import org.apache.hadoop.fs.FileSystem
 import org.apache.hadoop.io.SequenceFile.CompressionType
 import org.apache.hadoop.io.compress.CompressionCodec
 import org.apache.hadoop.mapred.{FileOutputCommitter, FileOutputFormat, JobConf, OutputFormat}
-import org.apache.hadoop.mapreduce.{Job => NewAPIHadoopJob, OutputFormat => NewOutputFormat, RecordWriter => NewRecordWriter, TaskAttemptID, TaskType}
+import org.apache.hadoop.mapreduce.{TaskAttemptContext, TaskAttemptID, TaskType, Job => NewAPIHadoopJob, OutputFormat => NewOutputFormat, RecordWriter => NewRecordWriter}
 import org.apache.hadoop.mapreduce.task.TaskAttemptContextImpl
-
 import org.apache.spark._
 import org.apache.spark.Partitioner.defaultPartitioner
 import org.apache.spark.annotation.Experimental
@@ -1109,7 +1107,8 @@ class PairRDDFunctions[K, V](self: RDD[(K, V)])
       val outputMetricsAndBytesWrittenCallback: Option[(OutputMetrics, () => Long)] =
         initHadoopOutputMetrics(context)
 
-      val writer = format.getRecordWriter(hadoopContext).asInstanceOf[NewRecordWriter[K, V]]
+      val writer = new SimplePairWriter[K, V](format.asInstanceOf[NewOutputFormat[K, V]]
+        , hadoopContext)
       require(writer != null, "Unable to obtain RecordWriter")
       var recordsWritten = 0L
       Utils.tryWithSafeFinallyAndFailureCallbacks {
@@ -1276,4 +1275,27 @@ private[spark] object PairRDDFunctions {
    * basis; see SPARK-4835 for more details.
    */
   val disableOutputSpecValidation: DynamicVariable[Boolean] = new DynamicVariable[Boolean](false)
+}
+
+
+private[spark] abstract class PairWriter[K, V](outputFormat: NewOutputFormat[K, V]
+                                               , context: TaskAttemptContext) {
+
+  def write(pair: (K, V)): Unit
+
+  def close(context: TaskAttemptContext): Unit
+
+}
+
+private[spark] class SimplePairWriter[K, V](outputFormat: NewOutputFormat[K, V]
+                                            , context: TaskAttemptContext)
+  extends PairWriter[K, V](outputFormat, context) {
+
+  private val writer = outputFormat.getRecordWriter(context)
+
+  override def write(pair: (K, V)): Unit = {
+     writer.write(pair._1, pair._2)
+  }
+
+  override def close(context: TaskAttemptContext): Unit = writer.close(context)
 }
