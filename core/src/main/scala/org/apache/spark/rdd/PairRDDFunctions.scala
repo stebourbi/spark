@@ -21,21 +21,23 @@ import java.nio.ByteBuffer
 import java.text.SimpleDateFormat
 import java.util.{Date, HashMap => JHashMap}
 
-import scala.collection.{mutable, Map}
+import scala.collection.{Map, mutable}
 import scala.collection.JavaConverters._
 import scala.collection.mutable.ArrayBuffer
 import scala.reflect.ClassTag
 import scala.util.DynamicVariable
-
 import com.clearspring.analytics.stream.cardinality.HyperLogLogPlus
 import org.apache.hadoop.conf.{Configurable, Configuration}
 import org.apache.hadoop.fs.FileSystem
+import org.apache.hadoop.io.DataInputBuffer
 import org.apache.hadoop.io.SequenceFile.CompressionType
 import org.apache.hadoop.io.compress.CompressionCodec
 import org.apache.hadoop.mapred.{FileOutputCommitter, FileOutputFormat, JobConf, OutputFormat}
-import org.apache.hadoop.mapreduce.{Job => NewAPIHadoopJob, OutputFormat => NewOutputFormat, RecordWriter => NewRecordWriter, TaskAttemptID, TaskType}
-import org.apache.hadoop.mapreduce.task.TaskAttemptContextImpl
-
+import org.apache.hadoop.mapreduce.{TaskAttemptID, TaskType, Job => NewAPIHadoopJob, OutputFormat => NewOutputFormat, RecordWriter => NewRecordWriter}
+import org.apache.hadoop.mapreduce.task.{ReduceContextImpl, TaskAttemptContextImpl}
+import org.apache.hadoop.mapreduce.lib.output.{LazyOutputFormat, MultipleOutputs}
+import org.apache.hadoop.mapreduce.task.TaskAttemptContextImpl.DummyReporter
+import org.apache.hadoop.mapreduce.counters.GenericCounter
 import org.apache.spark._
 import org.apache.spark.Partitioner.defaultPartitioner
 import org.apache.spark.annotation.Experimental
@@ -1152,6 +1154,108 @@ class PairRDDFunctions[K, V](self: RDD[(K, V)])
     jobCommitter.commitJob(jobTaskContext)
   }
 
+  def saveAsNewHadoopMultiOutputs[F <: NewOutputFormat[K, V]](path: String
+                                    , conf: Configuration = self.context.hadoopConfiguration
+                                    , fileDispatcher: (K, V) => String = (k: K, v: V) => k.toString)
+                                    (implicit fm: ClassTag[F]) {
+
+    // Rename this as hadoopConf internally to avoid shadowing (see SPARK-2038).
+    val hadoopConf = {
+      val _conf = conf
+      val job = new org.apache.hadoop.mapreduce.Job(_conf)
+      job.setOutputKeyClass(kt.runtimeClass)
+      job.setOutputValueClass(vt.runtimeClass)
+      LazyOutputFormat.setOutputFormatClass(job, fm.runtimeClass.asInstanceOf[Class[F]])
+      job.getConfiguration.set("mapred.output.dir", path)
+      job.getConfiguration
+    }
+    val job = NewAPIHadoopJob.getInstance(hadoopConf)
+    val formatter = new SimpleDateFormat("yyyyMMddHHmm")
+    val jobtrackerID = formatter.format(new Date())
+    val stageId = self.id
+    val jobConfiguration = job.getConfiguration
+    val wrappedConf = new SerializableConfiguration(jobConfiguration)
+    val outfmt = job.getOutputFormatClass
+    val jobFormat = outfmt.newInstance
+
+    if (isOutputSpecValidationEnabled) {
+      // FileOutputFormat ignores the filesystem parameter
+      jobFormat.checkOutputSpecs(job)
+    }
+
+    val writeShard = (context: TaskContext, itr: Iterator[(String, (K, V))]) => {
+      val config = wrappedConf.value
+      /* "reduce task" <split #> <attempt # = spark task #> */
+      val attemptId = new TaskAttemptID(jobtrackerID, stageId, TaskType.REDUCE, context.partitionId,
+        context.attemptNumber)
+      val hadoopContext = new TaskAttemptContextImpl(config, attemptId)
+      val format = outfmt.newInstance
+      format match {
+        case c: Configurable => c.setConf(config)
+        case _ => ()
+      }
+      val committer = format.getOutputCommitter(hadoopContext)
+      committer.setupTask(hadoopContext)
+
+      val outputMetricsAndBytesWrittenCallback: Option[(OutputMetrics, () => Long)] =
+        initHadoopOutputMetrics(context)
+
+      val recordWriter = format.getRecordWriter(hadoopContext).asInstanceOf[NewRecordWriter[K, V]]
+
+      val taskInputOutputContext = new ReduceContextImpl(wrappedConf.value
+        , attemptId
+        , new DummyIterator(itr)
+        , new GenericCounter
+        , new GenericCounter
+        , recordWriter
+        , committer
+        , new DummyReporter, null, kt.runtimeClass, vt.runtimeClass)
+
+      val writer = new MultipleOutputs(taskInputOutputContext)
+
+      require(writer != null, "Unable to obtain RecordWriter")
+      var recordsWritten = 0L
+      Utils.tryWithSafeFinallyAndFailureCallbacks {
+        while (itr.hasNext) {
+          val pair = itr.next()
+          writer.write(pair._2._1, pair._2._2, pair._1)
+
+          // Update bytes written metric every few records
+          maybeUpdateOutputMetrics(outputMetricsAndBytesWrittenCallback, recordsWritten)
+          recordsWritten += 1
+        }
+      }(finallyBlock = writer.close())
+      committer.commitTask(hadoopContext)
+      outputMetricsAndBytesWrittenCallback.foreach { case (om, callback) =>
+        om.setBytesWritten(callback())
+        om.setRecordsWritten(recordsWritten)
+      }
+      1
+    } : Int
+
+    val jobAttemptId = new TaskAttemptID(jobtrackerID, stageId, TaskType.MAP, 0, 0)
+    val jobTaskContext = new TaskAttemptContextImpl(wrappedConf.value, jobAttemptId)
+    val jobCommitter = jobFormat.getOutputCommitter(jobTaskContext)
+
+    // When speculation is on and output committer class name contains "Direct", we should warn
+    // users that they may loss data if they are using a direct output committer.
+    val speculationEnabled = self.conf.getBoolean("spark.speculation", false)
+    val outputCommitterClass = jobCommitter.getClass.getSimpleName
+    if (speculationEnabled && outputCommitterClass.contains("Direct")) {
+      val warningMessage =
+        s"$outputCommitterClass may be an output committer that writes data directly to " +
+          "the final location. Because speculation is enabled, this output committer may " +
+          "cause data loss (see the case in SPARK-10063). If possible, please use an output " +
+          "committer that does not have this behavior (e.g. FileOutputCommitter)."
+      logWarning(warningMessage)
+    }
+
+    jobCommitter.setupJob(jobTaskContext)
+    self.context.runJob(self.map(x => (fileDispatcher.apply(x._1, x._2), (x._1, x._2))), writeShard)
+    jobCommitter.commitJob(jobTaskContext)
+  }
+
+
   /**
    * Output the RDD to any Hadoop-supported storage system, using a Hadoop JobConf object for
    * that storage system. The JobConf should set an OutputFormat and any output paths required
@@ -1276,4 +1380,12 @@ private[spark] object PairRDDFunctions {
    * basis; see SPARK-4835 for more details.
    */
   val disableOutputSpecValidation: DynamicVariable[Boolean] = new DynamicVariable[Boolean](false)
+}
+
+class DummyIterator(itr: Iterator[_]) extends org.apache.hadoop.mapred.RawKeyValueIterator {
+  def getKey: DataInputBuffer = null
+  def getValue: DataInputBuffer = null
+  def getProgress: org.apache.hadoop.util.Progress = null
+  def next : Boolean = itr.hasNext
+  def close() : Unit = {}
 }
